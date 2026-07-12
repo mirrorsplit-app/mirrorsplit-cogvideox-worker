@@ -3,31 +3,46 @@ handler.py — CogVideoX-5B-I2V RunPod Serverless Worker
 ────────────────────────────────────────────────────────
 RunPod calls handler(job) once per inference request.
 
-Input schema (all optional except prompt):
-  prompt          str   Required. Video description. Max 2000 chars.
-  image           str   Optional. HTTPS URL or base64 JPEG/PNG.
-                        Triggers Image-to-Video mode when provided.
-                        Omit for Text-to-Video mode.
-  negative_prompt str   Optional. What to avoid.
-  num_frames      int   Optional. Default: 49 (≈6s @ 8fps). Max: 49.
-  num_steps       int   Optional. Default: 50. Range: 1–100.
-  guidance_scale  float Optional. Default: 6.0.
-  seed            int   Optional. -1 = random.
-  fps             int   Optional. Output FPS. Default: 8.
+Input schema
+────────────
+  prompt          str    Required. Video description. Max 2000 chars.
+  image           str    Optional. HTTPS URL or base64 JPEG/PNG.
+                         Triggers Image-to-Video mode when provided.
+  negative_prompt str    Optional. What to avoid.
+  duration        float  Optional. Desired video length in seconds (default 6).
+                         Converted to num_frames = round(duration × fps), capped
+                         at MAX_NUM_FRAMES (49).  Sent by the frontend as
+                         input.duration from VideoGenerateRequest.
+  aspect_ratio    str    Optional. "16:9" | "9:16" | "1:1" etc.
+                         Controls output width×height:
+                           16:9  → 720×480  (default)
+                           9:16  → 480×720
+                           1:1   → 480×480
+                           other → 720×480
+  num_frames      int    Optional. Explicit frame count. Overrides duration when
+                         both are supplied. Max 49.
+  num_steps       int    Optional. Denoising steps (default 50, range 1–100).
+  guidance_scale  float  Optional. CFG scale (default 6.0).
+  seed            int    Optional. -1 = random.
+  fps             int    Optional. Output video FPS (default 8).
 
-Output schema (success):
-  video_url       str   Publicly accessible URL (when S3 is configured).
-  video_b64       str   Base64-encoded MP4 (when S3 is not configured).
-  mode            str   "i2v" or "t2v".
-  num_frames      int   Frames generated.
-  fps             int   Output FPS.
-  seed            int   Seed used (for reproducibility).
-  generation_time float Seconds spent on inference only (seconds).
+Output schema (success)
+───────────────────────
+  video_url       str    Publicly accessible URL (when S3_BUCKET is set).
+  video_b64       str    Base64-encoded MP4 (when S3 is not configured).
+  mode            str    "i2v" or "t2v".
+  num_frames      int    Frames generated.
+  fps             int    Output FPS.
+  seed            int    Seed used (for reproducibility).
+  generation_time float  Seconds spent on inference.
+  total_time      float  Total handler wall-clock time.
 
-Output schema (error):
-  error           str   Human-readable error description.
-  traceback       str   Full Python traceback (always included on errors).
-  stage           str   Which stage failed (validation/model_load/inference/export/upload).
+Output schema (error)
+─────────────────────
+  error           str    Human-readable error description.
+  traceback       str    Full Python traceback.
+  stage           str    Which stage failed:
+                         validation / model_load / inference / export / upload
 """
 
 import base64
@@ -128,9 +143,17 @@ def _load_image(src: str):
 
 
 def validate(job_input: dict) -> dict:
-    """Validate and normalise raw RunPod job input."""
+    """
+    Validate and normalise raw RunPod job input.
 
-    # prompt
+    The frontend (RunPodProvider.buildWorkerInput) sends:
+        { prompt, duration, aspect_ratio, negative_prompt?, image? }
+
+    duration × fps  →  num_frames  (capped at MAX_NUM_FRAMES)
+    aspect_ratio    →  height, width
+    """
+
+    # ── prompt ────────────────────────────────────────────────────────────────
     prompt = job_input.get("prompt", "")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValidationError("'prompt' is required and must be a non-empty string")
@@ -138,12 +161,12 @@ def validate(job_input: dict) -> dict:
     if len(prompt) > 2000:
         raise ValidationError("'prompt' must be 2000 characters or fewer")
 
-    # negative_prompt
+    # ── negative_prompt ───────────────────────────────────────────────────────
     negative_prompt = job_input.get("negative_prompt", "")
     if not isinstance(negative_prompt, str):
         raise ValidationError("'negative_prompt' must be a string")
 
-    # image
+    # ── image (optional — triggers I2V mode) ──────────────────────────────────
     raw_image = job_input.get("image", "")
     pil_image = None
     mode = "t2v"
@@ -154,15 +177,61 @@ def validate(job_input: dict) -> dict:
         except Exception as exc:
             raise ValidationError(f"Failed to load image: {exc}") from exc
 
-    # num_frames
-    raw_frames = job_input.get("num_frames", config.DEFAULT_NUM_FRAMES)
+    # ── fps ───────────────────────────────────────────────────────────────────
+    raw_fps = job_input.get("fps", config.OUTPUT_FPS)
     try:
-        num_frames = int(raw_frames)
+        fps = int(raw_fps)
     except (TypeError, ValueError):
-        raise ValidationError(f"'num_frames' must be an integer, got: {raw_frames!r}")
+        fps = config.OUTPUT_FPS
+    fps = max(1, min(fps, 60))
+
+    # ── num_frames — derived from duration when not given explicitly ──────────
+    # The frontend sends `duration` (seconds).  num_frames = duration × fps.
+    # An explicit `num_frames` key overrides the duration calculation.
+    if "num_frames" in job_input:
+        try:
+            num_frames = int(job_input["num_frames"])
+        except (TypeError, ValueError):
+            raise ValidationError(
+                f"'num_frames' must be an integer, got: {job_input['num_frames']!r}"
+            )
+    elif "duration" in job_input:
+        try:
+            duration_sec = float(job_input["duration"])
+        except (TypeError, ValueError):
+            raise ValidationError(
+                f"'duration' must be a number (seconds), got: {job_input['duration']!r}"
+            )
+        if duration_sec <= 0:
+            raise ValidationError("'duration' must be positive")
+        # Round to nearest odd number — CogVideoX requires odd frame counts.
+        raw_frames = round(duration_sec * fps)
+        num_frames = raw_frames if raw_frames % 2 == 1 else raw_frames + 1
+        logger.info(
+            "  duration→frames : %.1fs × %dfps = %d frames (rounded to odd: %d)",
+            duration_sec, fps, raw_frames, num_frames,
+        )
+    else:
+        num_frames = config.DEFAULT_NUM_FRAMES
+
     num_frames = max(1, min(num_frames, config.MAX_NUM_FRAMES))
 
-    # num_steps
+    # ── aspect_ratio → height × width ────────────────────────────────────────
+    # CogVideoX-5B-I2V supports 720×480 and 480×720 natively.
+    # Other ratios are clamped to the closest supported size.
+    aspect_ratio = str(job_input.get("aspect_ratio", "16:9")).strip()
+    ASPECT_TO_HW: dict = {
+        "16:9":  (config.DEFAULT_HEIGHT, config.DEFAULT_WIDTH),   # 480×720
+        "9:16":  (config.DEFAULT_WIDTH,  config.DEFAULT_HEIGHT),  # 720×480 portrait
+        "1:1":   (480, 480),
+        "4:3":   (480, 640),
+        "3:4":   (640, 480),
+        "21:9":  (360, 848),
+    }
+    height, width = ASPECT_TO_HW.get(aspect_ratio, (config.DEFAULT_HEIGHT, config.DEFAULT_WIDTH))
+    logger.info("  aspect_ratio    : %s → %dx%d", aspect_ratio, width, height)
+
+    # ── num_steps ─────────────────────────────────────────────────────────────
     raw_steps = job_input.get("num_steps", config.DEFAULT_STEPS)
     try:
         num_steps = int(raw_steps)
@@ -170,14 +239,14 @@ def validate(job_input: dict) -> dict:
         raise ValidationError(f"'num_steps' must be an integer, got: {raw_steps!r}")
     num_steps = max(1, min(num_steps, 100))
 
-    # guidance_scale
+    # ── guidance_scale ────────────────────────────────────────────────────────
     raw_guidance = job_input.get("guidance_scale", config.DEFAULT_GUIDANCE)
     try:
         guidance_scale = float(raw_guidance)
     except (TypeError, ValueError):
         raise ValidationError(f"'guidance_scale' must be a float, got: {raw_guidance!r}")
 
-    # seed
+    # ── seed ──────────────────────────────────────────────────────────────────
     raw_seed = job_input.get("seed", config.DEFAULT_SEED)
     try:
         seed = int(raw_seed)
@@ -186,20 +255,14 @@ def validate(job_input: dict) -> dict:
     if seed == -1:
         seed = random.randint(0, 2 ** 32 - 1)
 
-    # fps
-    raw_fps = job_input.get("fps", config.OUTPUT_FPS)
-    try:
-        fps = int(raw_fps)
-    except (TypeError, ValueError):
-        fps = config.OUTPUT_FPS
-    fps = max(1, min(fps, 60))
-
     return {
         "prompt":          prompt,
         "negative_prompt": negative_prompt,
         "pil_image":       pil_image,
         "mode":            mode,
         "num_frames":      num_frames,
+        "height":          height,
+        "width":           width,
         "num_steps":       num_steps,
         "guidance_scale":  guidance_scale,
         "seed":            seed,
@@ -294,9 +357,10 @@ def handler(job):
         return {"error": str(exc), "traceback": traceback.format_exc(), "stage": "validation"}
 
     logger.info(
-        "[%s] validation OK in %s — mode=%s frames=%d steps=%d seed=%d",
+        "[%s] validation OK in %s — mode=%s frames=%d %dx%d steps=%d seed=%d",
         job_id, _elapsed(t_stage), params["mode"],
-        params["num_frames"], params["num_steps"], params["seed"],
+        params["num_frames"], params["width"], params["height"],
+        params["num_steps"], params["seed"],
     )
 
     # ── Stage 2: Load pipeline ─────────────────────────────────────────────────
@@ -320,8 +384,8 @@ def handler(job):
 
     call_kwargs = {
         "prompt":              params["prompt"],
-        "height":              config.DEFAULT_HEIGHT,
-        "width":               config.DEFAULT_WIDTH,
+        "height":              params["height"],
+        "width":               params["width"],
         "num_frames":          params["num_frames"],
         "num_inference_steps": params["num_steps"],
         "guidance_scale":      params["guidance_scale"],
@@ -335,7 +399,7 @@ def handler(job):
     logger.info(
         "[%s] inference kwargs: prompt='%s…' height=%d width=%d frames=%d steps=%d guidance=%.1f mode=%s",
         job_id,
-        params["prompt"][:60], config.DEFAULT_HEIGHT, config.DEFAULT_WIDTH,
+        params["prompt"][:60], params["height"], params["width"],
         params["num_frames"], params["num_steps"], params["guidance_scale"], params["mode"],
     )
     if torch.cuda.is_available():
