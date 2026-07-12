@@ -1,29 +1,34 @@
 # ─── CogVideoX Worker — Python dependencies ───────────────────────────────────
-# Uses ONLY stable PyPI releases — no git-source installs.
-# CogVideoXImageToVideoPipeline is included in diffusers >= 0.31.0.
+# Only stable PyPI releases. No git-source installs.
 #
-# Compatibility matrix:
-#   diffusers         0.32.1  — stable, includes CogVideoX I2V pipeline
-#   transformers      4.52.4  — accepts huggingface-hub 1.x (no <1.0 cap)
-#   accelerate        1.6.0   — compatible with transformers 4.52.x
-#   huggingface-hub   0.34.4  — pinned stable version; fixes Background writer
-#                               channel closed error during model download
+# ── CRITICAL VERSION NOTES ────────────────────────────────────────────────────
+#
+# diffusers==0.32.2
+#   The last stable release BEFORE Wan was added (Wan first appeared in 0.33.0).
+#   0.32.1 does NOT exist on PyPI — specifying it causes pip to silently resolve
+#   to the latest version (0.39+) which includes WanPipeline and causes the
+#   "autoencoder_kl_wan / infer_schema" errors on import.
+#   0.32.2 includes CogVideoXImageToVideoPipeline and has NO Wan code.
+#
+# huggingface-hub==0.34.4
+#   Pinned stable version. Fixes: RuntimeError: Background writer channel closed.
+#   Newer versions enable the xet transfer backend which fails on RunPod.
+#
+# transformers==4.47.1
+#   Last 4.x release with huggingface-hub<1.0 constraint satisfied by 0.34.4.
+#   transformers 4.48+ requires huggingface-hub>=0.24 which 0.34.4 satisfies.
 
 # ── RunPod Serverless SDK ──────────────────────────────────────────────────────
 runpod==1.7.3
 
-# ── Diffusers — stable PyPI release with CogVideoX I2V ────────────────────────
-diffusers==0.32.1
+# ── Diffusers — last release before Wan was introduced ────────────────────────
+# 0.32.2 has CogVideoXImageToVideoPipeline. 0.33.0+ has WanPipeline (unwanted).
+diffusers==0.32.2
 
 # ── HuggingFace stack ─────────────────────────────────────────────────────────
-
-# Pinned to fix: RuntimeError: Background writer channel closed
-# Newer hub versions use the xet transfer backend which fails in RunPod's
-# network environment. 0.34.4 is stable and uses the standard HTTP downloader.
 huggingface-hub==0.34.4
-
-transformers==4.52.4
-accelerate==1.6.0
+transformers==4.47.1
+accelerate==1.0.1
 safetensors==0.4.5
 sentencepiece==0.2.0
 
@@ -38,6 +43,7 @@ numpy==1.26.4
 tqdm==4.66.5
 einops==0.8.0
 ftfy==6.3.1
+packaging>=23.0          # used by model_manager version guard
 
 # ── Optional: S3 upload ────────────────────────────────────────────────────────
 # boto3==1.35.6
