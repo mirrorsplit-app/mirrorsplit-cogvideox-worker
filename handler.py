@@ -22,10 +22,12 @@ Output schema (success):
   num_frames      int   Frames generated.
   fps             int   Output FPS.
   seed            int   Seed used (for reproducibility).
-  generation_time float Seconds spent generating.
+  generation_time float Seconds spent on inference only (seconds).
 
 Output schema (error):
   error           str   Human-readable error description.
+  traceback       str   Full Python traceback (always included on errors).
+  stage           str   Which stage failed (validation/model_load/inference/export/upload).
 """
 
 import base64
@@ -34,13 +36,15 @@ import logging
 import os
 import random
 import time
+import traceback
 import uuid
 
 import runpod
 import torch
 
 import config
-from model_manager import get_pipeline
+from model_manager import get_pipeline, warm_up
+
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -49,7 +53,41 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 logger = logging.getLogger("cogvideox.handler")
-logger.info("CogVideoX worker starting — runpod version: %s", runpod.__version__)
+logger.info("=" * 60)
+logger.info("CogVideoX worker process starting")
+logger.info("  runpod version : %s", runpod.__version__)
+logger.info("  torch version  : %s", torch.__version__)
+logger.info("  CUDA available : %s", torch.cuda.is_available())
+if torch.cuda.is_available():
+    logger.info("  GPU            : %s", torch.cuda.get_device_name(0))
+    logger.info("  VRAM           : %.1f GB",
+                torch.cuda.get_device_properties(0).total_memory / (1024 ** 3))
+logger.info("  MODEL_ID       : %s", config.MODEL_ID)
+logger.info("  CPU_OFFLOAD    : %s", config.CPU_OFFLOAD)
+logger.info("  VAE_TILING     : %s", config.VAE_TILING)
+logger.info("=" * 60)
+
+
+# ── Warm-up: load the model NOW, at container startup ─────────────────────────
+# This is the fix for the timeout. Without this, the 18 GB model is downloaded
+# and loaded inside the first handler() call, which takes 5–15 minutes and
+# exceeds RunPod's execution timeout before inference even starts.
+#
+# With warm_up() here (module level), RunPod's container initialisation phase
+# runs this before any job is accepted. The container stays warm between jobs
+# and get_pipeline() returns the cached singleton instantly.
+_t_warmup_start = time.perf_counter()
+logger.info(">>> Starting model warm-up (this will take several minutes on first cold start)")
+try:
+    warm_up()
+    logger.info(">>> Warm-up complete in %.1fs — worker is ready to accept jobs",
+                time.perf_counter() - _t_warmup_start)
+except Exception as _warmup_exc:
+    # Log the full traceback so it appears in RunPod container logs.
+    logger.error(">>> Warm-up FAILED — worker will attempt to load model per-request")
+    logger.error(traceback.format_exc())
+    # Do NOT re-raise: let RunPod start the handler anyway.
+    # If the model fails to load, handler() will catch it and return {"error": ...}.
 
 
 # ── Input helpers ──────────────────────────────────────────────────────────────
@@ -175,28 +213,33 @@ def export_video(frames: list, fps: int, output_path: str) -> None:
     """Write list of PIL Images to MP4 using diffusers utility or imageio."""
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
+    # Try diffusers helper first
     try:
         from diffusers.utils import export_to_video
         export_to_video(frames, output_path, fps=fps)
+        logger.debug("export_video: used diffusers export_to_video")
         return
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("export_video: diffusers export_to_video failed (%s) — trying imageio", exc)
 
     # Fallback: imageio
     import imageio
     import numpy as np
     writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
-    for frame in frames:
-        if hasattr(frame, "convert"):
-            arr = np.array(frame.convert("RGB"))
-        elif hasattr(frame, "numpy"):
-            arr = frame.numpy()
-            if arr.dtype != np.uint8:
-                arr = (arr * 255).clip(0, 255).astype(np.uint8)
-        else:
-            arr = np.array(frame)
-        writer.append_data(arr)
-    writer.close()
+    try:
+        for frame in frames:
+            if hasattr(frame, "convert"):
+                arr = np.array(frame.convert("RGB"))
+            elif hasattr(frame, "numpy"):
+                arr = frame.numpy()
+                if arr.dtype != np.uint8:
+                    arr = (arr * 255).clip(0, 255).astype(np.uint8)
+            else:
+                arr = np.array(frame)
+            writer.append_data(arr)
+    finally:
+        writer.close()
+    logger.debug("export_video: used imageio fallback")
 
 
 # ── S3 upload ──────────────────────────────────────────────────────────────────
@@ -220,47 +263,61 @@ def upload_to_s3(local_path: str, key: str) -> str:
     return f"https://{config.S3_BUCKET}.s3.{config.S3_REGION}.amazonaws.com/{key}"
 
 
+# ── Timing helper ──────────────────────────────────────────────────────────────
+
+def _elapsed(t_start: float) -> str:
+    return f"{time.perf_counter() - t_start:.2f}s"
+
+
 # ── RunPod handler ─────────────────────────────────────────────────────────────
 
 def handler(job):
     """
     RunPod Serverless entry point.
     Receives: job = {"id": str, "input": dict}
-    Returns:  dict (success payload or {"error": str})
+    Returns:  dict (success payload or {"error": str, "traceback": str, "stage": str})
     """
-    job_id    = job.get("id", "local")
-    job_input = job.get("input", {})
+    t_job_start = time.perf_counter()
+    job_id      = job.get("id", "local")
+    job_input   = job.get("input", {})
 
-    logger.info("[%s] Job received", job_id)
+    logger.info("[%s] ── Job received ──────────────────────────────────", job_id)
+    logger.info("[%s] raw input keys: %s", job_id, list(job_input.keys()))
 
-    # 1. Validate input
+    # ── Stage 1: Validate ──────────────────────────────────────────────────────
+    t_stage = time.perf_counter()
+    logger.info("[%s] Stage 1/6 — validation", job_id)
     try:
         params = validate(job_input)
     except ValidationError as exc:
         logger.warning("[%s] Validation failed: %s", job_id, exc)
-        return {"error": str(exc)}
+        return {"error": str(exc), "traceback": traceback.format_exc(), "stage": "validation"}
 
     logger.info(
-        "[%s] mode=%s frames=%d steps=%d seed=%d",
-        job_id, params["mode"], params["num_frames"],
-        params["num_steps"], params["seed"],
+        "[%s] validation OK in %s — mode=%s frames=%d steps=%d seed=%d",
+        job_id, _elapsed(t_stage), params["mode"],
+        params["num_frames"], params["num_steps"], params["seed"],
     )
 
-    # 2. Load pipeline (singleton — instant on warm workers)
+    # ── Stage 2: Load pipeline ─────────────────────────────────────────────────
+    t_stage = time.perf_counter()
+    logger.info("[%s] Stage 2/6 — load pipeline (should be instant on warm worker)", job_id)
     try:
         pipe = get_pipeline()
     except Exception as exc:
-        logger.exception("[%s] Failed to load pipeline", job_id)
-        return {"error": f"Failed to load model: {exc}"}
+        tb = traceback.format_exc()
+        logger.error("[%s] Pipeline load FAILED in %s:\n%s", job_id, _elapsed(t_stage), tb)
+        return {"error": f"Failed to load model: {exc}", "traceback": tb, "stage": "model_load"}
 
-    # 3. Build generator
+    logger.info("[%s] pipeline ready in %s", job_id, _elapsed(t_stage))
+
+    # ── Stage 3: Build inference kwargs ───────────────────────────────────────
+    t_stage = time.perf_counter()
+    logger.info("[%s] Stage 3/6 — build inference kwargs", job_id)
+
     device    = "cuda" if torch.cuda.is_available() else "cpu"
     generator = torch.Generator(device=device).manual_seed(params["seed"])
 
-    # 4. Build call kwargs
-    # CogVideoXImageToVideoPipeline signature:
-    #   pipe(prompt, image=None, negative_prompt=None, height, width,
-    #        num_frames, num_inference_steps, guidance_scale, generator)
     call_kwargs = {
         "prompt":              params["prompt"],
         "height":              config.DEFAULT_HEIGHT,
@@ -275,50 +332,92 @@ def handler(job):
     if params["mode"] == "i2v" and params["pil_image"] is not None:
         call_kwargs["image"] = params["pil_image"]
 
-    # 5. Generate
-    t0 = time.perf_counter()
+    logger.info(
+        "[%s] inference kwargs: prompt='%s…' height=%d width=%d frames=%d steps=%d guidance=%.1f mode=%s",
+        job_id,
+        params["prompt"][:60], config.DEFAULT_HEIGHT, config.DEFAULT_WIDTH,
+        params["num_frames"], params["num_steps"], params["guidance_scale"], params["mode"],
+    )
+    if torch.cuda.is_available():
+        free_vram = (torch.cuda.get_device_properties(0).total_memory
+                     - torch.cuda.memory_allocated(0)) / (1024 ** 3)
+        logger.info("[%s] free VRAM before inference: %.1f GB", job_id, free_vram)
+
+    # ── Stage 4: Inference ────────────────────────────────────────────────────
+    t_stage = time.perf_counter()
+    logger.info("[%s] Stage 4/6 — inference started (this is the long step)", job_id)
     try:
         output = pipe(**call_kwargs)
     except torch.cuda.OutOfMemoryError:
-        logger.exception("[%s] CUDA OOM", job_id)
-        return {"error": "GPU out of memory. Reduce num_frames or enable CPU offload."}
+        tb = traceback.format_exc()
+        logger.error("[%s] CUDA OOM after %s:\n%s", job_id, _elapsed(t_stage), tb)
+        return {
+            "error":     "GPU out of memory. Reduce num_frames or enable CPU offload.",
+            "traceback": tb,
+            "stage":     "inference",
+        }
     except Exception as exc:
-        logger.exception("[%s] Generation error", job_id)
-        return {"error": f"Generation failed: {exc}"}
+        tb = traceback.format_exc()
+        logger.error("[%s] Inference FAILED after %s:\n%s", job_id, _elapsed(t_stage), tb)
+        return {"error": f"Generation failed: {exc}", "traceback": tb, "stage": "inference"}
 
-    generation_time = round(time.perf_counter() - t0, 2)
-    logger.info("[%s] Generated in %.1fs", job_id, generation_time)
+    generation_time = round(time.perf_counter() - t_stage, 2)
+    logger.info("[%s] inference complete in %.2fs", job_id, generation_time)
 
-    # 6. Export to MP4
+    # ── Stage 5: Export MP4 ───────────────────────────────────────────────────
+    t_stage = time.perf_counter()
+    logger.info("[%s] Stage 5/6 — export MP4", job_id)
+
     frames     = output.frames[0]
     filename   = f"{uuid.uuid4().hex}.mp4"
     video_path = os.path.join(config.OUTPUT_DIR, filename)
 
+    logger.info("[%s] exporting %d frames → %s", job_id, len(frames), video_path)
     try:
         export_video(frames, fps=params["fps"], output_path=video_path)
     except Exception as exc:
-        logger.exception("[%s] Export failed", job_id)
-        return {"error": f"Failed to encode video: {exc}"}
+        tb = traceback.format_exc()
+        logger.error("[%s] Export FAILED after %s:\n%s", job_id, _elapsed(t_stage), tb)
+        return {"error": f"Failed to encode video: {exc}", "traceback": tb, "stage": "export"}
 
-    # 7. Upload to S3 or encode as base64
+    file_size_mb = os.path.getsize(video_path) / (1024 ** 2)
+    logger.info("[%s] export done in %s — file: %.1f MB", job_id, _elapsed(t_stage), file_size_mb)
+
+    # ── Stage 6: Upload or base64 ─────────────────────────────────────────────
+    t_stage = time.perf_counter()
+    logger.info("[%s] Stage 6/6 — upload / encode output", job_id)
+
     video_url = ""
     video_b64 = ""
 
     if config.S3_BUCKET:
         try:
             video_url = upload_to_s3(video_path, f"cogvideox/{filename}")
-            logger.info("[%s] Uploaded: %s", job_id, video_url)
+            logger.info("[%s] S3 upload done in %s — url: %s", job_id, _elapsed(t_stage), video_url)
         except Exception as exc:
-            logger.exception("[%s] S3 upload failed — falling back to base64", job_id)
+            tb = traceback.format_exc()
+            logger.error("[%s] S3 upload FAILED after %s — falling back to base64:\n%s",
+                         job_id, _elapsed(t_stage), tb)
+            # Do NOT return error here — base64 fallback below will handle it
 
     if not video_url:
+        logger.info("[%s] encoding video as base64 (no S3 bucket configured or upload failed)", job_id)
+        t_b64 = time.perf_counter()
         with open(video_path, "rb") as f:
             video_b64 = base64.b64encode(f.read()).decode("utf-8")
+        logger.info("[%s] base64 encode done in %s — payload size: %.1f MB",
+                    job_id, _elapsed(t_b64), len(video_b64) / (1024 ** 2))
 
     try:
         os.remove(video_path)
     except OSError:
         pass
+
+    total_time = round(time.perf_counter() - t_job_start, 2)
+    logger.info(
+        "[%s] ── Job COMPLETE — total: %.2fs  inference: %.2fs  has_url: %s  has_b64: %s ──",
+        job_id, total_time, generation_time, bool(video_url), bool(video_b64),
+    )
 
     return {
         "video_url":       video_url,
@@ -328,6 +427,7 @@ def handler(job):
         "fps":             params["fps"],
         "seed":            params["seed"],
         "generation_time": generation_time,
+        "total_time":      total_time,
     }
 
 
