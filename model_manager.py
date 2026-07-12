@@ -20,6 +20,12 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# Disable xet transfer backend and hf-transfer — both cause
+# "Background writer channel closed" on RunPod's network environment.
+# Must be set BEFORE importing diffusers or huggingface_hub.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
 # ── Singleton ──────────────────────────────────────────────────────────────────
 _pipeline = None
 
@@ -39,6 +45,12 @@ def _load_pipeline():
     logger.info("  model_id  : %s", model_id)
     logger.info("  cache_dir : %s", cache_dir)
     logger.info("  device    : %s", device)
+
+    import huggingface_hub as _hfh
+    import diffusers as _dffs
+    logger.info("  huggingface_hub : %s", _hfh.__version__)
+    logger.info("  diffusers       : %s", _dffs.__version__)
+    logger.info("  torch           : %s", torch.__version__)
 
     pipe = CogVideoXImageToVideoPipeline.from_pretrained(
         model_id,

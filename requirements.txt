@@ -3,11 +3,11 @@
 # CogVideoXImageToVideoPipeline is included in diffusers >= 0.31.0.
 #
 # Compatibility matrix:
-#   diffusers       0.32.1  — stable, includes CogVideoX I2V pipeline
-#   transformers    4.52.4  — accepts huggingface-hub 1.x (no <1.0 cap)
-#   accelerate      1.6.0   — compatible with transformers 4.52.x
-#   huggingface-hub (no pin) — let pip resolve; diffusers 0.32.1 requires >=0.27.0
-#   torch 2.4.x             — pre-installed in base image (pytorch/pytorch)
+#   diffusers         0.32.1  — stable, includes CogVideoX I2V pipeline
+#   transformers      4.52.4  — accepts huggingface-hub 1.x (no <1.0 cap)
+#   accelerate        1.6.0   — compatible with transformers 4.52.x
+#   huggingface-hub   0.34.4  — pinned stable version; fixes Background writer
+#                               channel closed error during model download
 
 # ── RunPod Serverless SDK ──────────────────────────────────────────────────────
 runpod==1.7.3
@@ -16,6 +16,12 @@ runpod==1.7.3
 diffusers==0.32.1
 
 # ── HuggingFace stack ─────────────────────────────────────────────────────────
+
+# Pinned to fix: RuntimeError: Background writer channel closed
+# Newer hub versions use the xet transfer backend which fails in RunPod's
+# network environment. 0.34.4 is stable and uses the standard HTTP downloader.
+huggingface-hub==0.34.4
+
 transformers==4.52.4
 accelerate==1.6.0
 safetensors==0.4.5
