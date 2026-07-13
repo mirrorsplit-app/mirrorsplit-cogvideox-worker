@@ -190,14 +190,36 @@ def _load_pipeline():
     logger.info(">>> from_pretrained() done in %.1fs", time.perf_counter() - t_pretrained)
 
     # ── Memory optimisations ──────────────────────────────────────────────────
+    # VAE slicing — decodes one frame at a time through the VAE decoder.
+    # The official docs call this alongside tiling. Without it the full video
+    # latent tensor is decoded at once, causing OOM on consumer GPUs and
+    # introducing decoding artifacts when the VAE runs out of headroom.
+    if config.VAE_SLICING:
+        pipe.vae.enable_slicing()
+        logger.info("  VAE slicing       : enabled")
+
+    # VAE tiling — splits the spatial dimensions into tiles for the decoder.
+    # Additive with slicing: both should be enabled for maximum stability.
     if config.VAE_TILING:
         pipe.vae.enable_tiling()
         logger.info("  VAE tiling        : enabled")
 
     t_device = time.perf_counter()
     if device == "cuda" and config.CPU_OFFLOAD:
-        pipe.enable_sequential_cpu_offload()
-        logger.info("  CPU offload       : enabled (%.1fs)", time.perf_counter() - t_device)
+        # enable_model_cpu_offload() — official recommendation for 24 GB GPUs.
+        # Keeps the full model on CPU and moves each sub-model to GPU only when
+        # it is needed, then immediately moves it back. Uses ~19 GB VRAM.
+        #
+        # DO NOT use enable_sequential_cpu_offload() for quality work:
+        #   - Moves individual LAYERS (not sub-models) CPU↔GPU
+        #   - ~4 GB VRAM but 10-20× slower inference
+        #   - Extra precision casts between CPU float32 and GPU bfloat16 on
+        #     every layer boundary introduce cumulative rounding errors that
+        #     manifest as temporal artifacts, unstable details, and washed-out
+        #     motion — exactly the symptoms reported.
+        pipe.enable_model_cpu_offload()
+        logger.info("  CPU offload       : model_cpu_offload enabled (%.1fs)",
+                    time.perf_counter() - t_device)
     else:
         pipe.to(device)
         if device == "cuda":

@@ -142,7 +142,39 @@ def _load_image(src: str):
     raise ValidationError("'image' must be an HTTPS URL or a base64-encoded image")
 
 
-def validate(job_input: dict) -> dict:
+def _preprocess_image(pil_image, width: int, height: int):
+    """
+    Resize and center-crop a PIL image to exactly (width, height).
+
+    This matches what CogVideoXImageToVideoPipeline's VideoProcessor does
+    internally — but doing it explicitly here guarantees the spatial dimensions
+    fed into the VAE encoder are exactly what the model expects.
+
+    Without this, passing an arbitrary-resolution image causes the VAE to
+    encode at the wrong spatial scale.  The transformer then denoises latents
+    that are misaligned with the text conditioning, producing the classic
+    "input image with slight motion and no scene generation" artifact.
+
+    Steps (matching VideoProcessor.preprocess):
+      1. Resize shortest side to target, preserving aspect ratio (LANCZOS)
+      2. Center-crop to exact (width, height)
+      3. Return RGB PIL image — the pipeline normalises to [-1, 1] internally
+    """
+    from PIL import Image
+
+    # Step 1 — resize so the image fills the target box
+    src_w, src_h = pil_image.size
+    scale = max(width / src_w, height / src_h)
+    new_w = round(src_w * scale)
+    new_h = round(src_h * scale)
+    resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
+
+    # Step 2 — center crop
+    left = (new_w - width)  // 2
+    top  = (new_h - height) // 2
+    cropped = resized.crop((left, top, left + width, top + height))
+
+    return cropped.convert("RGB")
     """
     Validate and normalise raw RunPod job input.
 
@@ -176,6 +208,8 @@ def validate(job_input: dict) -> dict:
             mode = "i2v"
         except Exception as exc:
             raise ValidationError(f"Failed to load image: {exc}") from exc
+        # Preprocessing is deferred to after we know height/width (resolved below).
+        # _preprocess_image() is called at the end of this function.
 
     # ── fps ───────────────────────────────────────────────────────────────────
     raw_fps = job_input.get("fps", config.OUTPUT_FPS)
@@ -186,8 +220,11 @@ def validate(job_input: dict) -> dict:
     fps = max(1, min(fps, 60))
 
     # ── num_frames — derived from duration when not given explicitly ──────────
-    # The frontend sends `duration` (seconds).  num_frames = duration × fps.
-    # An explicit `num_frames` key overrides the duration calculation.
+    # CogVideoX requires num_frames = k*4 + 1  (1, 5, 9, … 45, 49).
+    # This is because the VAE temporal scale factor is 4:
+    #   latent_frames = (num_frames - 1) / 4   must be an integer.
+    # The previous odd-rounding rule was wrong — odd numbers like 47 or 51
+    # are NOT valid; only multiples-of-4-plus-1 are.
     if "num_frames" in job_input:
         try:
             num_frames = int(job_input["num_frames"])
@@ -204,11 +241,12 @@ def validate(job_input: dict) -> dict:
             )
         if duration_sec <= 0:
             raise ValidationError("'duration' must be positive")
-        # Round to nearest odd number — CogVideoX requires odd frame counts.
         raw_frames = round(duration_sec * fps)
-        num_frames = raw_frames if raw_frames % 2 == 1 else raw_frames + 1
+        # Snap to nearest valid value: k*4 + 1, e.g. 1,5,9,...,49
+        k = max(0, round((raw_frames - 1) / 4))
+        num_frames = k * 4 + 1
         logger.info(
-            "  duration→frames : %.1fs × %dfps = %d frames (rounded to odd: %d)",
+            "  duration→frames : %.1fs × %dfps = %d raw → snapped to %d (k*4+1 rule)",
             duration_sec, fps, raw_frames, num_frames,
         )
     else:
@@ -254,6 +292,18 @@ def validate(job_input: dict) -> dict:
         raise ValidationError(f"'seed' must be an integer, got: {raw_seed!r}")
     if seed == -1:
         seed = random.randint(0, 2 ** 32 - 1)
+
+    # ── Preprocess image to exact target resolution ───────────────────────────
+    # Must happen after height/width are resolved from aspect_ratio.
+    # Resize + center-crop to (width, height) so the VAE encoder receives
+    # exactly the spatial dimensions the model was trained on.
+    if pil_image is not None:
+        orig_size = pil_image.size
+        pil_image = _preprocess_image(pil_image, width=width, height=height)
+        logger.info(
+            "  image preprocess: %dx%d → %dx%d (resize+center-crop)",
+            orig_size[0], orig_size[1], width, height,
+        )
 
     return {
         "prompt":          prompt,
@@ -382,25 +432,44 @@ def handler(job):
     device    = "cuda" if torch.cuda.is_available() else "cpu"
     generator = torch.Generator(device=device).manual_seed(params["seed"])
 
-    call_kwargs = {
+    # NOTE: CogVideoXImageToVideoPipeline.__call__ signature:
+    #   pipe(image, prompt, ...)
+    # The image is the FIRST positional argument, not a keyword argument.
+    # Passing it only as a kwarg works in most diffusers versions but passing
+    # it positionally matches the official example and avoids routing bugs.
+    #
+    # use_dynamic_cfg=True — officially recommended for I2V.
+    # Linearly decays guidance_scale from the given value down to 1.0 across
+    # the denoising timesteps. Without this, constant high CFG in I2V mode
+    # over-conditions on the text prompt and under-uses the image conditioning,
+    # causing washed-out motion and scene instability.
+    #
+    # max_sequence_length=226 — must match the T5 encoder's max context.
+    # Without this the encoder silently truncates long prompts, discarding
+    # scene details that would drive cinematic motion.
+
+    call_kwargs: dict = {
         "prompt":              params["prompt"],
         "height":              params["height"],
         "width":               params["width"],
         "num_frames":          params["num_frames"],
         "num_inference_steps": params["num_steps"],
         "guidance_scale":      params["guidance_scale"],
+        "use_dynamic_cfg":     True,
+        "max_sequence_length": config.MAX_SEQUENCE_LENGTH,
         "generator":           generator,
     }
+
     if params["negative_prompt"]:
         call_kwargs["negative_prompt"] = params["negative_prompt"]
-    if params["mode"] == "i2v" and params["pil_image"] is not None:
-        call_kwargs["image"] = params["pil_image"]
 
     logger.info(
-        "[%s] inference kwargs: prompt='%s…' height=%d width=%d frames=%d steps=%d guidance=%.1f mode=%s",
+        "[%s] inference kwargs: prompt='%s…' height=%d width=%d frames=%d "
+        "steps=%d guidance=%.1f use_dynamic_cfg=True max_seq=%d mode=%s",
         job_id,
         params["prompt"][:60], params["height"], params["width"],
-        params["num_frames"], params["num_steps"], params["guidance_scale"], params["mode"],
+        params["num_frames"], params["num_steps"], params["guidance_scale"],
+        config.MAX_SEQUENCE_LENGTH, params["mode"],
     )
     if torch.cuda.is_available():
         free_vram = (torch.cuda.get_device_properties(0).total_memory
@@ -411,7 +480,13 @@ def handler(job):
     t_stage = time.perf_counter()
     logger.info("[%s] Stage 4/6 — inference started (this is the long step)", job_id)
     try:
-        output = pipe(**call_kwargs)
+        if params["mode"] == "i2v" and params["pil_image"] is not None:
+            # Official signature: pipe(image, prompt, ...)
+            # Image is passed as the first positional argument so diffusers
+            # routes it correctly into the image encoder regardless of version.
+            output = pipe(params["pil_image"], **call_kwargs)
+        else:
+            output = pipe(**call_kwargs)
     except torch.cuda.OutOfMemoryError:
         tb = traceback.format_exc()
         logger.error("[%s] CUDA OOM after %s:\n%s", job_id, _elapsed(t_stage), tb)

@@ -36,18 +36,39 @@ DEFAULT_HEIGHT:     int   = int(os.getenv("DEFAULT_HEIGHT",     "480"))
 DEFAULT_WIDTH:      int   = int(os.getenv("DEFAULT_WIDTH",      "720"))
 DEFAULT_NUM_FRAMES: int   = int(os.getenv("DEFAULT_NUM_FRAMES", "49"))
 DEFAULT_STEPS:      int   = int(os.getenv("DEFAULT_STEPS",      "50"))
+
+# guidance_scale=6.0 matches the official CogVideoX-5B-I2V default.
+# use_dynamic_cfg=True in handler.py decays this linearly to 1.0 across
+# timesteps — so this is the starting value, not a constant CFG.
 DEFAULT_GUIDANCE:   float = float(os.getenv("DEFAULT_GUIDANCE", "6.0"))
 DEFAULT_SEED:       int   = int(os.getenv("DEFAULT_SEED",       "-1"))   # -1 = random
 
+# Only k*4+1 values are valid for CogVideoX (VAE temporal scale factor = 4).
+# Valid sequence: 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49.
 MAX_NUM_FRAMES:     int   = int(os.getenv("MAX_NUM_FRAMES",     "49"))
+
+# T5 encoder maximum sequence length. Must match the transformer config.
+# Without this, long prompts are silently truncated, discarding scene details.
+MAX_SEQUENCE_LENGTH: int  = int(os.getenv("MAX_SEQUENCE_LENGTH", "226"))
 
 # ── Memory optimisation ────────────────────────────────────────────────────────
 
-# VAE tiling — reduces peak VRAM during decoding.  Safe to leave on everywhere.
+# VAE slicing — decodes one frame at a time through the VAE decoder.
+# Official recommendation: call alongside tiling. Without it the full video
+# latent tensor is decoded at once, causing OOM on consumer GPUs and
+# decoding artifacts when VRAM headroom is tight.
+VAE_SLICING: bool = os.getenv("VAE_SLICING", "true").lower() == "true"
+
+# VAE tiling — splits spatial dimensions into tiles for the decoder.
+# Additive with slicing: both should be true for maximum stability.
+# Safe to leave on everywhere — no quality loss, only VRAM reduction.
 VAE_TILING: bool = os.getenv("VAE_TILING", "true").lower() == "true"
 
-# Sequential CPU offload — required on GPUs with < 24 GB VRAM.
-# Set CPU_OFFLOAD=false on A40 / A100 / H100 for faster inference.
+# Model CPU offload — official recommendation for 24 GB GPUs.
+# Uses ~19 GB VRAM, moves each sub-model to GPU only when needed.
+# DO NOT use sequential CPU offload (old setting) — it moves individual
+# layers, is 10-20× slower, and introduces precision artifacts that cause
+# unstable motion and washed-out scene generation.
 CPU_OFFLOAD: bool = os.getenv("CPU_OFFLOAD", "true").lower() == "true"
 
 # ── Output ─────────────────────────────────────────────────────────────────────
