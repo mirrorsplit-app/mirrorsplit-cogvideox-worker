@@ -175,6 +175,9 @@ def _preprocess_image(pil_image, width: int, height: int):
     cropped = resized.crop((left, top, left + width, top + height))
 
     return cropped.convert("RGB")
+
+
+def validate(job_input: dict) -> dict:
     """
     Validate and normalise raw RunPod job input.
 
@@ -193,6 +196,8 @@ def _preprocess_image(pil_image, width: int, height: int):
     if len(prompt) > 2000:
         raise ValidationError("'prompt' must be 2000 characters or fewer")
 
+    logger.info("  prompt          : '%s…' (%d chars)", prompt[:60], len(prompt))
+
     # ── negative_prompt ───────────────────────────────────────────────────────
     negative_prompt = job_input.get("negative_prompt", "")
     if not isinstance(negative_prompt, str):
@@ -203,13 +208,15 @@ def _preprocess_image(pil_image, width: int, height: int):
     pil_image = None
     mode = "t2v"
     if raw_image and isinstance(raw_image, str) and raw_image.strip():
+        logger.info("  image           : present (%d chars) — loading…", len(raw_image))
         try:
             pil_image = _load_image(raw_image.strip())
             mode = "i2v"
+            logger.info("  image loaded    : %dx%d px  mode=i2v", pil_image.size[0], pil_image.size[1])
         except Exception as exc:
             raise ValidationError(f"Failed to load image: {exc}") from exc
-        # Preprocessing is deferred to after we know height/width (resolved below).
-        # _preprocess_image() is called at the end of this function.
+    else:
+        logger.info("  image           : not provided — running text-to-video (t2v)")
 
     # ── fps ───────────────────────────────────────────────────────────────────
     raw_fps = job_input.get("fps", config.OUTPUT_FPS)
@@ -221,10 +228,6 @@ def _preprocess_image(pil_image, width: int, height: int):
 
     # ── num_frames — derived from duration when not given explicitly ──────────
     # CogVideoX requires num_frames = k*4 + 1  (1, 5, 9, … 45, 49).
-    # This is because the VAE temporal scale factor is 4:
-    #   latent_frames = (num_frames - 1) / 4   must be an integer.
-    # The previous odd-rounding rule was wrong — odd numbers like 47 or 51
-    # are NOT valid; only multiples-of-4-plus-1 are.
     if "num_frames" in job_input:
         try:
             num_frames = int(job_input["num_frames"])
@@ -251,23 +254,22 @@ def _preprocess_image(pil_image, width: int, height: int):
         )
     else:
         num_frames = config.DEFAULT_NUM_FRAMES
+        logger.info("  num_frames      : using default %d", num_frames)
 
     num_frames = max(1, min(num_frames, config.MAX_NUM_FRAMES))
 
     # ── aspect_ratio → height × width ────────────────────────────────────────
-    # CogVideoX-5B-I2V supports 720×480 and 480×720 natively.
-    # Other ratios are clamped to the closest supported size.
     aspect_ratio = str(job_input.get("aspect_ratio", "16:9")).strip()
     ASPECT_TO_HW: dict = {
-        "16:9":  (config.DEFAULT_HEIGHT, config.DEFAULT_WIDTH),   # 480×720
-        "9:16":  (config.DEFAULT_WIDTH,  config.DEFAULT_HEIGHT),  # 720×480 portrait
+        "16:9":  (config.DEFAULT_HEIGHT, config.DEFAULT_WIDTH),
+        "9:16":  (config.DEFAULT_WIDTH,  config.DEFAULT_HEIGHT),
         "1:1":   (480, 480),
         "4:3":   (480, 640),
         "3:4":   (640, 480),
         "21:9":  (360, 848),
     }
     height, width = ASPECT_TO_HW.get(aspect_ratio, (config.DEFAULT_HEIGHT, config.DEFAULT_WIDTH))
-    logger.info("  aspect_ratio    : %s → %dx%d", aspect_ratio, width, height)
+    logger.info("  aspect_ratio    : %s → %dx%d (w×h)", aspect_ratio, width, height)
 
     # ── num_steps ─────────────────────────────────────────────────────────────
     raw_steps = job_input.get("num_steps", config.DEFAULT_STEPS)
@@ -295,15 +297,18 @@ def _preprocess_image(pil_image, width: int, height: int):
 
     # ── Preprocess image to exact target resolution ───────────────────────────
     # Must happen after height/width are resolved from aspect_ratio.
-    # Resize + center-crop to (width, height) so the VAE encoder receives
-    # exactly the spatial dimensions the model was trained on.
     if pil_image is not None:
         orig_size = pil_image.size
         pil_image = _preprocess_image(pil_image, width=width, height=height)
         logger.info(
-            "  image preprocess: %dx%d → %dx%d (resize+center-crop)",
+            "  image preprocess: %dx%d → %dx%d px (resize+center-crop)",
             orig_size[0], orig_size[1], width, height,
         )
+
+    logger.info(
+        "  final params    : mode=%s frames=%d %dx%d steps=%d guidance=%.1f seed=%d fps=%d",
+        mode, num_frames, width, height, num_steps, guidance_scale, seed, fps,
+    )
 
     return {
         "prompt":          prompt,
